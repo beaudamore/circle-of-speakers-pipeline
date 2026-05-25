@@ -269,6 +269,9 @@ class Pipeline:
                 "model": model_name,
                 "messages": messages,
                 "stream": True,
+                # Empty string avoids open-webui's get_event_emitter None.startswith() crash
+                # while keeping `if chat_id` falsy downstream — matches pre-update behavior.
+                "chat_id": "",
             }
             
             # Only request usage if explicitly enabled
@@ -301,6 +304,8 @@ class Pipeline:
             reasoning_active = False
             in_thinking_tags = False  # Track XML <think>/<thinking> tag state across chunks
             captured_usage = None  # Track usage from stream
+            sse_lines_seen = 0
+            content_chars_yielded = 0
 
             with requests.post(
                 url, headers=headers, json=payload, stream=True, timeout=120
@@ -310,11 +315,13 @@ class Pipeline:
                     for line in response.iter_lines():
                         if not line:
                             continue
+                        sse_lines_seen += 1
                         line_str = line.decode("utf-8")
+                        self._dbg_full(f"  SSE line #{sse_lines_seen}: {self._truncate(line_str, 400)}")
                         if line_str.startswith("data: "):
                             data_str = line_str[6:]
                             if data_str.strip() == "[DONE]":
-                                self._dbg_step("  Stream finished: [DONE] received.")
+                                self._dbg_step(f"  Stream finished: [DONE] received. SSE lines={sse_lines_seen} yielded_chars={content_chars_yielded}")
                                 # Yield usage data as special marker before finishing
                                 if captured_usage:
                                     yield f"__USAGE_DATA__:{json.dumps(captured_usage)}"
@@ -394,6 +401,7 @@ class Pipeline:
                                             if after:
                                                 yield f"__THINKING_TAG_CONTENT__:{after}"
                                     else:
+                                        content_chars_yielded += len(content)
                                         yield content
 
                                 if isinstance(delta, dict):

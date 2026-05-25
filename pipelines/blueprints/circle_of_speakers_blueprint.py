@@ -214,7 +214,7 @@ class Pipeline(StreamingBlueprint):
                 "type": "status",
                 "data": {
                     "description": f"Found {len(initial_speakers)} speakers. Selecting order...",
-                    "done": False,
+                    "done": True,
                 },
             }
         }
@@ -228,17 +228,17 @@ class Pipeline(StreamingBlueprint):
         active_speakers = self._analyze_user_message_for_speaker_order(
             user_message, initial_speakers, recent_context, tag_query, memory_context
         )
-        final_order = [speaker["name"] for speaker in active_speakers]
+        # final_order = [speaker["name"] for speaker in active_speakers]
 
-        yield {
-            "event": {
-                "type": "status",
-                "data": {
-                    "description": f"**AI Speaker Order:** {' → '.join(final_order)}",
-                    "done": True,
-                },
-            }
-        }
+        # yield {
+        #     "event": {
+        #         "type": "status",
+        #         "data": {
+        #             "description": f"**AI Speaker Order:** {' → '.join(final_order)}",
+        #             "done": True,
+        #         },
+        #     }
+        # }
 
         # Visual feedback showing selected speakers
         speaker_count = len(active_speakers)
@@ -880,46 +880,91 @@ Select and order the speakers now."""
             self._dbg_step(f"  Orchestration messages: {len(ordering_messages)} messages")
 
             ordering_model_id = self._resolve_model_id(self.valves.ORCHESTRATION_MODEL_NAME)
+            self._dbg_step(f"  Orchestration model: name='{self.valves.ORCHESTRATION_MODEL_NAME}' resolved_id='{ordering_model_id}'")
 
             # Get AI analysis
             response = ""
+            chunk_count = 0
+            non_content_chunks = []
             for chunk in self._query_openwebui_model_streaming(ordering_model_id, ordering_messages):
+                chunk_count += 1
                 if chunk and not chunk.startswith("❌"):
+                    # Track special markers separately so we can see them on full_debug
+                    if chunk.startswith("__"):
+                        non_content_chunks.append(chunk[:200])
                     response += chunk
+
+            self._dbg_step(f"  Orchestrator stream: {chunk_count} chunks, response len={len(response)}")
+            if non_content_chunks:
+                self._dbg_step(f"  Orchestrator received {len(non_content_chunks)} marker chunks (e.g. __REASONING__, __THINKING__, __USAGE__)")
+                self._dbg_full(f"  Marker chunks: {non_content_chunks}")
+            self._dbg_full("  Raw orchestrator response (repr, truncated 2000):")
+            self._dbg_full(self._truncate(repr(response), 2000))
 
             # Parse markdown response to get ordered speaker names
             if response.strip():
+                self._dbg_step(f"  --- PARSE BEGIN --- response len={len(response)} ---")
+                self._dbg_full(f"  PARSE.input.repr: {self._truncate(repr(response), 800)}")
                 lines = response.strip().split("\n")
+                self._dbg_step(f"  PARSE: split into {len(lines)} lines")
                 ordered_names = []
 
-                for line in lines:
+                for line_idx, line in enumerate(lines):
+                    raw_line = line
                     line = line.strip()
-                    if line.startswith("#####"):
+                    has_prefix = line.startswith("#####")
+                    self._dbg_full(f"  PARSE.line[{line_idx}].repr={self._truncate(repr(raw_line), 300)} stripped.repr={self._truncate(repr(line), 300)} has_##### prefix={has_prefix}")
+                    if has_prefix:
                         speaker_name = line.replace("#####", "").strip()
+                        self._dbg_step(f"  PARSE.line[{line_idx}] extracted name.repr={repr(speaker_name)}")
                         if speaker_name:
                             ordered_names.append(speaker_name)
-                self._dbg_step(f"  AI Ordered Names: {ordered_names}")
+                self._dbg_step(f"  --- PARSE END --- AI Ordered Names ({len(ordered_names)}): {ordered_names}")
+                self._dbg_full(f"  --- MATCH BEGIN --- active_speakers count={len(active_speakers)}")
+                self._dbg_full(f"  active_speakers (name/model pairs):")
+                for sp in active_speakers:
+                    self._dbg_full(f"    name.repr={repr(sp.get('name'))} model.repr={repr(sp.get('model'))}")
 
                 # Reorder speakers based on AI recommendation
                 ordered_speakers = []
 
                 for name in ordered_names:
                     name_lower = name.lower().strip()
+                    self._dbg_full(f"  MATCH attempting name.repr={repr(name_lower)}")
+                    matched = False
                     for speaker in active_speakers:
                         speaker_name_lower = speaker["name"].lower().strip()
+                        speaker_model_lower = (speaker.get("model") or "").lower().strip()
+
+                        # Normalize unicode dashes (em dash –, en dash —) to hyphen for comparison
+                        def _norm(s):
+                            return s.replace('\u2013', '-').replace('\u2014', '-')
+                        name_norm = _norm(name_lower)
+                        speaker_name_norm = _norm(speaker_name_lower)
 
                         # Multiple matching strategies for flexibility
-                        if (
-                            speaker_name_lower == name_lower
-                            or name_lower in speaker_name_lower
-                            or speaker_name_lower in name_lower
-                            or speaker_name_lower.split(",")[0].strip() == name_lower
-                            or speaker_name_lower.split()[0] == name_lower
-                        ):
-                            ordered_speakers.append(speaker)
-                            self._dbg_step(f"  ✅ Matched '{name}' to speaker '{speaker['name']}'")
-                            break
+                        check_eq = speaker_name_norm == name_norm
+                        check_name_in_speaker = name_norm in speaker_name_norm
+                        check_speaker_in_name = speaker_name_norm in name_norm
+                        check_comma_first = speaker_name_norm.split(",")[0].strip() == name_norm
+                        check_space_first = speaker_name_norm.split()[0] == name_norm
+                        # Also check model ID match (per user: "uses model ID")
+                        check_model_eq = bool(speaker_model_lower) and speaker_model_lower == name_norm
+                        check_model_in_name = bool(speaker_model_lower) and speaker_model_lower in name_norm
+                        check_name_in_model = bool(speaker_model_lower) and name_norm in speaker_model_lower
 
+                        if any([check_eq, check_name_in_speaker, check_speaker_in_name,
+                                check_comma_first, check_space_first]):
+                            ordered_speakers.append(speaker)
+                            self._dbg_step(f"  ✅ Matched '{name}' to speaker name='{speaker['name']}' model='{speaker.get('model')}' via flags eq={check_eq} n_in_s={check_name_in_speaker} s_in_n={check_speaker_in_name} comma1st={check_comma_first} space1st={check_space_first}")
+                            matched = True
+                            break
+                        else:
+                            self._dbg_full(f"    MISS name.repr={repr(name_lower)} vs sp.name.repr={repr(speaker_name_lower)} sp.model.repr={repr(speaker_model_lower)} | flags name-checks=eq:{check_eq},n_in_s:{check_name_in_speaker},s_in_n:{check_speaker_in_name},comma1st:{check_comma_first},space1st:{check_space_first} model-checks(NOT USED)=eq:{check_model_eq},m_in_n:{check_model_in_name},n_in_m:{check_name_in_model}")
+                    if not matched:
+                        self._dbg_step(f"  ⚠️ No active speaker matched orchestrator name '{name}'")
+
+                self._dbg_step(f"  --- MATCH END --- Final selection: {len(ordered_names)} names → {len(ordered_speakers)} matched speakers")
                 return ordered_speakers
             else:
                 raise ValueError(
