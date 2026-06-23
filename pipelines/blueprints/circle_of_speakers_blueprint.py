@@ -49,9 +49,8 @@ class Pipeline(StreamingBlueprint):
         ORCHESTRATION_MODEL_NAME: str = Field(
             default="Intelligent Speaker Ordering",
             description="Model name to use for intelligent speaker orchestration. "
-                        "The system prompt from this model will be used as the orchestration prompt template. "
-                        "Use {user_message}, {conversation_context}, and {speaker_expertise} as placeholders. "
-                        "{speaker_expertise} contains each speaker's name, description (expertise), and tags in markdown format.",
+                        "The model's OpenWebUI system prompt defines the selection rules; "
+                        "the pipeline sends the available cast, conversation context, and user message.",
         )
 
         DECISION_CONTEXT_DEPTH: int = Field(
@@ -764,55 +763,6 @@ class Pipeline(StreamingBlueprint):
             recent_context = "\n".join(context_parts)
         return recent_context
 
-    def _get_orchestration_prompt_template(self) -> str:
-        """
-        Fetch the system prompt from the orchestration model to use as the prompt template.
-        Returns the system prompt or raises if not found.
-        """
-        try:
-            ordering_model_id = self._resolve_model_id(self.valves.ORCHESTRATION_MODEL_NAME)
-
-            for model in self.available_models:
-                if model.get("id") == ordering_model_id or model.get("name") == self.valves.ORCHESTRATION_MODEL_NAME:
-                    params = model.get("params", {})
-                    if not isinstance(params, dict):
-                        raise ValueError(
-                            f"Orchestration model '{self.valves.ORCHESTRATION_MODEL_NAME}' has invalid structure - "
-                            f"'params' is not a dict: {type(params)}"
-                        )
-
-                    system_prompt = params.get("system", "")
-
-                    if system_prompt:
-                        self._dbg_step(f"✅ Extracted system prompt from orchestration model '{self.valves.ORCHESTRATION_MODEL_NAME}'")
-                        self._dbg_step(f"   Prompt length: {len(system_prompt)} characters")
-                        return system_prompt
-                    else:
-                        if self._is_full_debug():
-                            raise ValueError(
-                                f"Orchestration model '{self.valves.ORCHESTRATION_MODEL_NAME}' has no system prompt in params.system. "
-                                f"Model structure: {json.dumps(model, indent=2)}"
-                            )
-                        else:
-                            model_name = model.get('name', 'unknown')
-                            model_id = model.get('id', 'unknown')
-                            raise ValueError(
-                                f"Orchestration model '{self.valves.ORCHESTRATION_MODEL_NAME}' has no system prompt in params.system "
-                                f"(model name='{model_name}', id='{model_id}'). Enable Full Debug to dump full model."
-                            )
-
-            raise ValueError(
-                f"Orchestration model '{self.valves.ORCHESTRATION_MODEL_NAME}' not found in available models. "
-                f"Available models: {[m.get('name') for m in self.available_models]}"
-            )
-
-        except ValueError:
-            raise
-        except Exception as e:
-            raise RuntimeError(
-                f"Unexpected error fetching orchestration prompt from model '{self.valves.ORCHESTRATION_MODEL_NAME}': {e}"
-            ) from e
-
     def _analyze_user_message_for_speaker_order(
         self,
         user_message: str,
@@ -882,27 +832,33 @@ Select and order the speakers now."""
             ordering_model_id = self._resolve_model_id(self.valves.ORCHESTRATION_MODEL_NAME)
             self._dbg_step(f"  Orchestration model: name='{self.valves.ORCHESTRATION_MODEL_NAME}' resolved_id='{ordering_model_id}'")
 
-            # Get AI analysis
-            response = ""
-            chunk_count = 0
-            non_content_chunks = []
-            for chunk in self._query_openwebui_model_streaming(ordering_model_id, ordering_messages):
-                chunk_count += 1
-                if chunk and not chunk.startswith("❌"):
-                    # Track special markers separately so we can see them on full_debug
-                    if chunk.startswith("__"):
-                        non_content_chunks.append(chunk[:200])
-                    response += chunk
+            def collect_ordering_response(messages: List[dict]) -> str:
+                response = ""
+                chunk_count = 0
+                non_content_chunks = []
+                for chunk in self._query_openwebui_model_streaming(ordering_model_id, messages):
+                    chunk_count += 1
+                    if chunk and not chunk.startswith("❌"):
+                        if chunk.startswith("__"):
+                            non_content_chunks.append(chunk[:200])
+                            continue
+                        response += chunk
 
-            self._dbg_step(f"  Orchestrator stream: {chunk_count} chunks, response len={len(response)}")
-            if non_content_chunks:
-                self._dbg_step(f"  Orchestrator received {len(non_content_chunks)} marker chunks (e.g. __REASONING__, __THINKING__, __USAGE__)")
-                self._dbg_full(f"  Marker chunks: {non_content_chunks}")
-            self._dbg_full("  Raw orchestrator response (repr, truncated 2000):")
-            self._dbg_full(self._truncate(repr(response), 2000))
+                self._dbg_step(f"  Orchestrator stream: {chunk_count} chunks, response len={len(response)}")
+                if non_content_chunks:
+                    self._dbg_step(f"  Orchestrator ignored {len(non_content_chunks)} marker chunks (e.g. __REASONING__, __THINKING__, __USAGE__)")
+                    self._dbg_full(f"  Marker chunks: {non_content_chunks}")
+                self._dbg_full("  Raw orchestrator response (repr, truncated 2000):")
+                self._dbg_full(self._truncate(repr(response), 2000))
+                return response
 
-            # Parse markdown response to get ordered speaker names
-            if response.strip():
+            def parse_ordered_names(response: str) -> List[str]:
+                if not response.strip():
+                    raise ValueError(
+                        f"Orchestration model '{self.valves.ORCHESTRATION_MODEL_NAME}' returned empty response. "
+                        f"The model may not be working properly or its system prompt may be incorrect."
+                    )
+
                 self._dbg_step(f"  --- PARSE BEGIN --- response len={len(response)} ---")
                 self._dbg_full(f"  PARSE.input.repr: {self._truncate(repr(response), 800)}")
                 lines = response.strip().split("\n")
@@ -920,57 +876,47 @@ Select and order the speakers now."""
                         if speaker_name:
                             ordered_names.append(speaker_name)
                 self._dbg_step(f"  --- PARSE END --- AI Ordered Names ({len(ordered_names)}): {ordered_names}")
+                return ordered_names
+
+            def match_ordered_names(ordered_names: List[str]) -> tuple[List[dict], List[str]]:
                 self._dbg_full(f"  --- MATCH BEGIN --- active_speakers count={len(active_speakers)}")
                 self._dbg_full(f"  active_speakers (name/model pairs):")
                 for sp in active_speakers:
                     self._dbg_full(f"    name.repr={repr(sp.get('name'))} model.repr={repr(sp.get('model'))}")
 
-                # Reorder speakers based on AI recommendation
                 ordered_speakers = []
+                invalid_names = []
+                matched_keys = set()
+                speakers_by_name = {speaker["name"]: speaker for speaker in active_speakers}
 
                 for name in ordered_names:
-                    name_lower = name.lower().strip()
-                    self._dbg_full(f"  MATCH attempting name.repr={repr(name_lower)}")
-                    matched = False
-                    for speaker in active_speakers:
-                        speaker_name_lower = speaker["name"].lower().strip()
-                        speaker_model_lower = (speaker.get("model") or "").lower().strip()
-
-                        # Normalize unicode dashes (em dash –, en dash —) to hyphen for comparison
-                        def _norm(s):
-                            return s.replace('\u2013', '-').replace('\u2014', '-')
-                        name_norm = _norm(name_lower)
-                        speaker_name_norm = _norm(speaker_name_lower)
-
-                        # Multiple matching strategies for flexibility
-                        check_eq = speaker_name_norm == name_norm
-                        check_name_in_speaker = name_norm in speaker_name_norm
-                        check_speaker_in_name = speaker_name_norm in name_norm
-                        check_comma_first = speaker_name_norm.split(",")[0].strip() == name_norm
-                        check_space_first = speaker_name_norm.split()[0] == name_norm
-                        # Also check model ID match (per user: "uses model ID")
-                        check_model_eq = bool(speaker_model_lower) and speaker_model_lower == name_norm
-                        check_model_in_name = bool(speaker_model_lower) and speaker_model_lower in name_norm
-                        check_name_in_model = bool(speaker_model_lower) and name_norm in speaker_model_lower
-
-                        if any([check_eq, check_name_in_speaker, check_speaker_in_name,
-                                check_comma_first, check_space_first]):
+                    speaker = speakers_by_name.get(name.strip())
+                    if speaker:
+                        speaker_key = speaker.get("model") or speaker.get("name")
+                        if speaker_key not in matched_keys:
                             ordered_speakers.append(speaker)
-                            self._dbg_step(f"  ✅ Matched '{name}' to speaker name='{speaker['name']}' model='{speaker.get('model')}' via flags eq={check_eq} n_in_s={check_name_in_speaker} s_in_n={check_speaker_in_name} comma1st={check_comma_first} space1st={check_space_first}")
-                            matched = True
-                            break
-                        else:
-                            self._dbg_full(f"    MISS name.repr={repr(name_lower)} vs sp.name.repr={repr(speaker_name_lower)} sp.model.repr={repr(speaker_model_lower)} | flags name-checks=eq:{check_eq},n_in_s:{check_name_in_speaker},s_in_n:{check_speaker_in_name},comma1st:{check_comma_first},space1st:{check_space_first} model-checks(NOT USED)=eq:{check_model_eq},m_in_n:{check_model_in_name},n_in_m:{check_name_in_model}")
-                    if not matched:
+                            matched_keys.add(speaker_key)
+                            self._dbg_step(f"  ✅ Matched exact speaker name='{speaker['name']}' model='{speaker.get('model')}'")
+                    else:
+                        invalid_names.append(name)
                         self._dbg_step(f"  ⚠️ No active speaker matched orchestrator name '{name}'")
 
-                self._dbg_step(f"  --- MATCH END --- Final selection: {len(ordered_names)} names → {len(ordered_speakers)} matched speakers")
-                return ordered_speakers
-            else:
+                self._dbg_step(f"  --- MATCH END --- Final selection: {len(ordered_names)} names → {len(ordered_speakers)} matched speakers; invalid={invalid_names}")
+                return ordered_speakers, invalid_names
+
+            response = collect_ordering_response(ordering_messages)
+            ordered_names = parse_ordered_names(response)
+            ordered_speakers, invalid_names = match_ordered_names(ordered_names)
+
+            if invalid_names:
+                self._dbg_step(f"  ⚠️ Ignoring invalid orchestrator names: {invalid_names}")
+
+            if not ordered_speakers:
                 raise ValueError(
-                    f"Orchestration model '{self.valves.ORCHESTRATION_MODEL_NAME}' returned empty response. "
-                    f"The model may not be working properly or its system prompt may be incorrect."
+                    "Orchestration returned no valid speakers from the available cast."
                 )
+
+            return ordered_speakers
 
         except (requests.exceptions.RequestException, json.JSONDecodeError, ValueError) as e:
             self._dbg_step(f"❌ CRITICAL: Intelligent ordering failed: {e}")
