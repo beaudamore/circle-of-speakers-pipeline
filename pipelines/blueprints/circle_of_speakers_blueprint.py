@@ -10,6 +10,7 @@ description: Full Circle of Speakers blueprint - provides multi-speaker orchestr
 from typing import List, Dict, Optional
 import json
 import re
+from urllib.parse import quote
 import gc
 from datetime import datetime
 from pydantic import Field
@@ -80,12 +81,16 @@ class Pipeline(StreamingBlueprint):
         # PROFILE IMAGE CONFIGURATION
         # ======================================================================
         PROFILE_THUMBNAIL_ROOT: str = Field(
-            default="https://images.crossandfaith.com/image/",
-            description="Base URL for speaker profile images. Images will be accessed as {root_url}{model_id}.png",
+            default="/api/v1/models/model/profile/image?id={model_id}&width={size}",
+            description="URL template for speaker avatars. Placeholders: {model_id} (URL-encoded Open WebUI model id) "
+                        "and {size} (PROFILE_IMAGE_SIZE). The default uses Open WebUI's own model-image endpoint; "
+                        "the width parameter needs the feature from open-webui discussion #32756, stock Open WebUI "
+                        "ignores it and serves the stored size. A value without placeholders is treated as a prefix: "
+                        "{root}{model_id}?width={size}. Leave empty to show names only.",
         )
         PROFILE_IMAGE_SIZE: int = Field(
             default=60,
-            description="Profile image size in pixels (square dimensions, e.g., 60 = 60x60px)",
+            description="Requested avatar width in pixels (fills {size} in PROFILE_THUMBNAIL_ROOT).",
         )
 
         # ======================================================================
@@ -631,14 +636,29 @@ class Pipeline(StreamingBlueprint):
             f"SPEAKER_TAGS Description Hint: Filter speakers by tags. {syntax_guide} {available_tags_str}"
         )
 
+    def get_speaker_image_url(self, speaker: dict) -> Optional[str]:
+        """
+        Build the avatar URL for a speaker from PROFILE_THUMBNAIL_ROOT.
+
+        Template form (contains {model_id} and/or {size}): placeholders are filled, the
+        model id URL-encoded. Prefix form (no placeholders): legacy
+        "{root}{model_id}?width={size}" used by external resizers. Empty root: None.
+        """
+        thumbnail_root = str(getattr(self.valves, "PROFILE_THUMBNAIL_ROOT", "") or "").strip()
+        if not thumbnail_root:
+            return None
+        size = getattr(self.valves, "PROFILE_IMAGE_SIZE", 60)
+        model_id = str(speaker["model"])
+        if "{model_id}" in thumbnail_root or "{size}" in thumbnail_root:
+            return thumbnail_root.replace("{model_id}", quote(model_id, safe="")).replace("{size}", str(size))
+        return f"{thumbnail_root}{model_id}?width={size}"
+
     def get_speaker_image_markdown(self, speaker: dict, greeting: bool = False) -> str:
         """Generate consistent speaker image markdown with optional microphone emoji for greeting."""
         emoji = "🎤 " if greeting else ""
-        thumbnail_root = getattr(self.valves, "PROFILE_THUMBNAIL_ROOT", None)
-        size = getattr(self.valves, "PROFILE_IMAGE_SIZE", 60)
+        profile_image_url = self.get_speaker_image_url(speaker)
 
-        if thumbnail_root and thumbnail_root.strip():
-            profile_image_url = f"{thumbnail_root}{speaker['model']}?width={size}"
+        if profile_image_url:
             return f'![{speaker["name"]}]({profile_image_url}) **{speaker["name"]}**:\n'
         else:
             return f"**{emoji}{speaker['name']}:**\n"

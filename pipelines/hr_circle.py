@@ -72,12 +72,14 @@ class Pipeline(CircleBlueprint):
         # PROFILE IMAGES
         # ==============================================================
         PROFILE_THUMBNAIL_ROOT: str = Field(
-            default="https://images.crossandfaith.com/image/",
-            description="Base URL for speaker profile images. Images accessed as {root_url}{model_id}?width={size}",
+            default="/api/v1/models/model/profile/image?id={model_id}&width={size}",
+            description="Avatar URL template with {model_id} and {size} placeholders (default: Open WebUI's own "
+                        "model-image endpoint). No placeholders = prefix form {root}{model_id}?width={size} for an "
+                        "external resizer. Empty = names only.",
         )
         PROFILE_IMAGE_SIZE: int = Field(
             default=60,
-            description="Profile image size in pixels (square dimensions, e.g., 60 = 60x60px)",
+            description="Requested avatar width in pixels (fills {size}).",
         )
 
         # ==============================================================

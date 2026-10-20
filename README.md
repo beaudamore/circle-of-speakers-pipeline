@@ -15,9 +15,9 @@ A streaming Open WebUI **pipeline** that turns any tagged set of Open WebUI mode
 ## What you get
 
 - **One pipeline file per circle** — `biblical_circle.py`, `dynamic_circle.py`, `stoic_circle.py`, `hr_circle.py`, `legal_circle.py`. Each is a tiny ~100-line shim that sets `SPEAKER_TAGS` and inherits from the shared blueprint.
-- **The shared `circle_of_speakers_blueprint.py`** (~1300 lines) does the heavy lifting:
+- **The shared `circle_of_speakers_blueprint.py`** (~1100 lines) does the heavy lifting:
   - Discovers Open WebUI models tagged for the circle
-  - Asks an **"Intelligent Speaker Ordering"** model who should respond next, given recent conversation context
+  - Sends the tag-filtered cast, recent conversation and the user's message to an **"Intelligent Speaker Ordering"** model and runs the speakers it names, in that order
   - Streams each chosen speaker's response in turn through Open WebUI
   - Injects a one-time introduction the first time each speaker appears
   - Personalizes responses by extracting profile info from the user's system prompt
@@ -49,6 +49,29 @@ flowchart LR
 
 Each "speaker" is just an Open WebUI model — could be a base model with a system prompt, a fine-tuned LoRA, or any other registered model. The blueprint filters which ones participate in a given circle by tag (`biblical`, `stoic`, etc.) and lets the **Intelligent Speaker Ordering** model decide who responds next based on the conversation so far.
 
+### Speaker ordering contract
+
+The selection rules live in Open WebUI, not in Python. The pipeline only sends data and validates the answer:
+
+- The ordering model's **Open WebUI system prompt** owns every selection rule (how many speakers, mandatory mentions, ordering). Edit it in the Open WebUI model editor; there is no prompt text to change in the pipeline.
+- The pipeline sends one user message containing `AVAILABLE CAST` (name, description and tags of every model that matches `SPEAKER_TAGS`), `RECENT CONVERSATION` (the last `DECISION_CONTEXT_DEPTH` rounds, plus memory context when present) and `USER'S MESSAGE`.
+- Reasoning / thinking / usage marker chunks from the ordering model are ignored, so a reasoning model works as the orderer.
+- Only **exact** names from the filtered cast are accepted. Invented or partial names are logged and dropped; if nothing valid remains the pipeline raises an orchestration error instead of guessing.
+
+The cleanup that produced this contract is documented in [`docs/orchestration-cleanup-handoff.md`](docs/orchestration-cleanup-handoff.md).
+
+### Speaker thumbnails
+
+Each speaker's turn starts with a markdown image followed by the bold speaker name. Open WebUI renders images inside message content at their **native pixel size** (there is no size syntax, and raw `<img>` tags are shown as text in chat), so the image has to arrive already small. `PROFILE_THUMBNAIL_ROOT` is a URL template with two placeholders, `{model_id}` (URL-encoded) and `{size}`:
+
+```text
+![{name}](/api/v1/models/model/profile/image?id={model_id}&width={size}) **{name}**:
+```
+
+The default asks Open WebUI itself for the speaker model's avatar. The `width` parameter is a proposed Open WebUI feature ([discussion #32756](https://github.com/open-webui/open-webui/discussions/32756), branch [`feature/model-profile-image-width`](https://github.com/beaudamore/open-webui/tree/feature/model-profile-image-width)); stock Open WebUI ignores it and serves the stored 250 px avatar. Users need read access to the speaker models, otherwise Open WebUI returns its default logo.
+
+A root without placeholders is treated as a prefix, `{root}{model_id}?width={size}`, which is the form an external resizer such as [`image_resizer`](https://github.com/beaudamore/image_resizer) expects. Leave `PROFILE_THUMBNAIL_ROOT` empty to print names only. The small round avatar Open WebUI shows next to the message belongs to the circle pipeline model itself; it is scaled by CSS and cannot be changed per speaker.
+
 ---
 
 ## Quick start
@@ -57,7 +80,8 @@ Each "speaker" is just an Open WebUI model — could be a base model with a syst
 
 - A running [Open WebUI](https://openwebui.com) instance with the **Pipelines** addon enabled.
 - One or more registered Open WebUI models tagged for your circle (e.g., tag = `biblical`).
-- An "Intelligent Speaker Ordering" model registered in Open WebUI — any chat model with the system prompt from [`prompts/base/intelligent_speaker_ordering.md`](prompts/base/intelligent_speaker_ordering.md).
+- An "Intelligent Speaker Ordering" model registered in Open WebUI — any chat model with the system prompt from [`prompts/base/intelligent_speaker_ordering.md`](prompts/base/intelligent_speaker_ordering.md) (or [`intelligent_speaker_ordering_v2.md`](prompts/base/intelligent_speaker_ordering_v2.md), which adds an explicit "only use names from the list" rule). The pipeline validates names exactly, so the prompt must tell the model to copy them verbatim.
+- The circle model's own system prompt (set in Open WebUI on the `Biblical Circle` model) is the per-speaker template from [`prompts/base/pipeline_prompt.md`](prompts/base/pipeline_prompt.md); the pipeline reads it from the request and fills in `{speaker_name}`, `{user_message}` and the other placeholders.
 
 ### Install a circle
 
@@ -129,12 +153,17 @@ The full set of valves is documented inline in [`pipelines/blueprints/circle_of_
 
 | Valve | Default | What it does |
 | --- | --- | --- |
+| `OPENWEBUI_ENDPOINT` | `http://host.docker.internal:3000` | Open WebUI URL as seen from the Pipelines container. |
+| `OPENWEBUI_API_KEY` | (empty, required) | Admin JWT used to list models and call speakers. |
 | `SPEAKER_TAGS` | `""` (set per circle) | Comma = OR, plus = AND. Filters the model registry. |
-| `ORCHESTRATION_MODEL_NAME` | `Intelligent Speaker Ordering` | The Open WebUI model that decides turn order. |
+| `ORCHESTRATION_MODEL_NAME` | `Intelligent Speaker Ordering` | The Open WebUI model that decides turn order. Its Open WebUI system prompt holds the rules. |
 | `DECISION_CONTEXT_DEPTH` | `4` | How many recent rounds the orderer sees. |
+| `HISTORY_MAX_ROUNDS` | `0` | Rounds of prior history kept when building context (`0` = all). |
 | `ENABLE_DYNAMIC_INTRODUCTIONS` | `true` | One-time intro the first time each speaker appears in a conversation. |
 | `ENABLE_USER_PROFILE_INTEGRATION` | `true` | Extracts personal info from the user's system prompt and weaves it into responses. |
-| `PROFILE_THUMBNAIL_ROOT` | `https://images.crossandfaith.com/image/` | Per-speaker avatar source. Replace with your own. |
+| `PROFILE_THUMBNAIL_ROOT` | `/api/v1/models/model/profile/image?id={model_id}&width={size}` | Avatar URL template. No placeholders = prefix form for external resizers. Empty = names only. |
+| `PROFILE_IMAGE_SIZE` | `60` | Pixel width filled into `{size}`. |
+| `FIRST_SPEAKER_PROMPT_PREFIX` / `INTRODUCTION_PROMPT_PREFIX` | (text) | Prefixes added to the speaker template for the opening speaker and for first appearances. |
 | `enable_full_debug` / `enable_step_debug` | `false` | Verbose logging while you're tuning. |
 
 ---
@@ -145,6 +174,8 @@ The full set of valves is documented inline in [`pipelines/blueprints/circle_of_
 .
 ├── README.md
 ├── LICENSE
+├── docs/
+│   └── orchestration-cleanup-handoff.md       Why ordering rules live in Open WebUI
 ├── pipelines/
 │   ├── blueprints/
 │   │   ├── circle_of_speakers_blueprint.py    The reusable base
