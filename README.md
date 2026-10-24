@@ -168,6 +168,13 @@ The full set of valves is documented inline in [`pipelines/blueprints/circle_of_
 
 ---
 
+## Guides
+
+- [User profile integration](docs/user-profile-integration.md)
+- [Web search context](docs/web-search-context.md)
+
+---
+
 ## Project structure
 
 ```text
