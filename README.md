@@ -60,6 +60,21 @@ The selection rules live in Open WebUI, not in Python. The pipeline only sends d
 
 The cleanup that produced this contract is documented in [`docs/orchestration-cleanup-handoff.md`](docs/orchestration-cleanup-handoff.md).
 
+### Prompt layout and prompt caching
+
+Since 2026-11-02 each speaker request is built as:
+
+1. **system:** the circle model's Open WebUI system prompt with only `{speaker_name}` filled in, so it is the same for a speaker in every round;
+2. **history:** the conversation so far (current message excluded), segregated per speaker since 2026-11-03: the user's messages as user turns, each stored circle reply split into this speaker's own block as an assistant turn and the other speakers' blocks in a user turn labelled "These are their words, not yours and not the user's", so a speaker never sees another's first-person take under its own role;
+3. **user:** the user's message, as its own plain turn (byte-identical to how Open WebUI stores it, so the first user turn is the same from round one on).
+4. **user:** a per-round context block (introduction or first-speaker cue, `CURRENT DATE`, current speakers, this round's previous takes trimmed to 200 characters, historical speakers, web research, memory and user profile when present), then "Answer the user's message in the previous turn now, as <name>.".
+
+Before, all of that was formatted into the system prompt every round and speakers got no history. Engines reuse their prompt cache only for a matching prefix (llama.cpp slot cache, vLLM prefix caching), so a system prompt that changed every round meant a full prefill for every speaker, every round. Now the system prompt and the history are a stable prefix and only the newest exchange plus the current turn are new. A slot-cache proxy that keys a conversation by its first user turn also sees the same key every round. Measured on a 2026-11-02 test chat: round 2 reused 30% of the prompt tokens, round 3 53%.
+
+**Migration:** replace the circle model's system prompt in Open WebUI with [`prompts/base/pipeline_prompt.md`](prompts/base/pipeline_prompt.md). An old prompt still runs (its other placeholders are filled with empty strings) but shows empty labels. Keep `HISTORY_MAX_ROUNDS` at `0` or a large value: a sliding window shifts the prefix every round once full, which defeats the cache; the cost of no cap is that long chats grow toward the model's context limit.
+
+Full description, worked example and how to measure: [`docs/prompt-layout.md`](docs/prompt-layout.md).
+
 ### Speaker thumbnails
 
 Each speaker's turn starts with a markdown image followed by the bold speaker name. Open WebUI renders images inside message content at their **native pixel size** (there is no size syntax, and raw `<img>` tags are shown as text in chat), so the image has to arrive already small. `PROFILE_THUMBNAIL_ROOT` is a URL template with two placeholders, `{model_id}` (URL-encoded) and `{size}`:
@@ -81,7 +96,8 @@ A root without placeholders is treated as a prefix, `{root}{model_id}?width={siz
 - A running [Open WebUI](https://openwebui.com) instance with the **Pipelines** addon enabled.
 - One or more registered Open WebUI models tagged for your circle (e.g., tag = `biblical`).
 - An "Intelligent Speaker Ordering" model registered in Open WebUI — any chat model with the system prompt from [`prompts/base/intelligent_speaker_ordering.md`](prompts/base/intelligent_speaker_ordering.md) (or [`intelligent_speaker_ordering_v2.md`](prompts/base/intelligent_speaker_ordering_v2.md), which adds an explicit "only use names from the list" rule). The pipeline validates names exactly, so the prompt must tell the model to copy them verbatim.
-- The circle model's own system prompt (set in Open WebUI on the `Biblical Circle` model) is the per-speaker template from [`prompts/base/pipeline_prompt.md`](prompts/base/pipeline_prompt.md); the pipeline reads it from the request and fills in `{speaker_name}`, `{user_message}` and the other placeholders.
+- The circle model's own system prompt (set in Open WebUI on the `Biblical Circle` model) is the per-speaker template from [`prompts/base/pipeline_prompt.md`](prompts/base/pipeline_prompt.md); the pipeline reads it from the request and fills in `{speaker_name}` only; everything per round travels in the final user turn (see Prompt layout and prompt caching).
+  The template carries two identity rules (2026-11-02): "you are {speaker_name}", and "the other speakers' takes are other people speaking in the first person; their stories are theirs, not yours". The second one exists because without it a speaker will claim another's deeds (Paul saying "I denied Him three times").
 
 ### Install a circle
 
@@ -158,12 +174,12 @@ The full set of valves is documented inline in [`pipelines/blueprints/circle_of_
 | `SPEAKER_TAGS` | `""` (set per circle) | Comma = OR, plus = AND. Filters the model registry. |
 | `ORCHESTRATION_MODEL_NAME` | `Intelligent Speaker Ordering` | The Open WebUI model that decides turn order. Its Open WebUI system prompt holds the rules. |
 | `DECISION_CONTEXT_DEPTH` | `4` | How many recent rounds the orderer sees. |
-| `HISTORY_MAX_ROUNDS` | `0` | Rounds of prior history kept when building context (`0` = all). |
+| `HISTORY_MAX_ROUNDS` | `0` | Rounds of prior history kept when building context (`0` = all). Keep `0` or large for prompt caching, see [prompt layout](docs/prompt-layout.md). |
 | `ENABLE_DYNAMIC_INTRODUCTIONS` | `true` | One-time intro the first time each speaker appears in a conversation. |
 | `ENABLE_USER_PROFILE_INTEGRATION` | `true` | Extracts personal info from the user's system prompt and weaves it into responses. |
 | `PROFILE_THUMBNAIL_ROOT` | `/api/v1/models/model/profile/image?id={model_id}&width={size}` | Avatar URL template. No placeholders = prefix form for external resizers. Empty = names only. |
 | `PROFILE_IMAGE_SIZE` | `60` | Pixel width filled into `{size}`. |
-| `FIRST_SPEAKER_PROMPT_PREFIX` / `INTRODUCTION_PROMPT_PREFIX` | (text) | Prefixes added to the speaker template for the opening speaker and for first appearances. |
+| `FIRST_SPEAKER_PROMPT_PREFIX` / `INTRODUCTION_PROMPT_PREFIX` | (text) | Cue placed at the start of the per-round context block (final user turn) for the opening speaker and for first appearances. |
 | `enable_full_debug` / `enable_step_debug` | `false` | Verbose logging while you're tuning. |
 
 ---
@@ -172,6 +188,7 @@ The full set of valves is documented inline in [`pipelines/blueprints/circle_of_
 
 - [User profile integration](docs/user-profile-integration.md)
 - [Web search context](docs/web-search-context.md)
+- [Speaker prompt layout and prompt caching](docs/prompt-layout.md)
 
 ---
 
@@ -182,7 +199,8 @@ The full set of valves is documented inline in [`pipelines/blueprints/circle_of_
 ├── README.md
 ├── LICENSE
 ├── docs/
-│   └── orchestration-cleanup-handoff.md       Why ordering rules live in Open WebUI
+│   ├── orchestration-cleanup-handoff.md       Why ordering rules live in Open WebUI
+│   └── prompt-layout.md                       Speaker request layout and prompt caching
 ├── pipelines/
 │   ├── blueprints/
 │   │   ├── circle_of_speakers_blueprint.py    The reusable base

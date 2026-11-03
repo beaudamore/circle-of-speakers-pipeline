@@ -8,7 +8,7 @@ The active Circle of Speakers blueprint consumes web-search context that Open We
 2. Open WebUI supplies results in a system message containing `<context>` and `<source>` elements.
 3. The pipeline reads the first matching context block.
 4. Each source is collapsed to one line and truncated to 300 characters.
-5. The formatted research is appended to the shared awareness prompt before orchestration and speaker generation.
+5. The formatted research goes to the orchestrator, and to each speaker inside the per-round context block of the final user turn (never into the system prompt, which stays a stable prompt-cache prefix; since 2026-11-02).
 6. Every selected speaker receives the same research context.
 
 When matching context is found, the pipeline emits this message before selecting speakers:

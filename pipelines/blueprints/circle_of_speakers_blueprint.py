@@ -102,8 +102,8 @@ class Pipeline(StreamingBlueprint):
                 "so focus on giving the user a helpful, engaging response that reflects your "
                 "personality, background, and natural way of speaking as {speaker_name}."
             ),
-            description="Terse prefix prepended to the pipeline System Prompt for the first speaker. "
-                        "This gets added before the main awareness prompt.",
+            description="Terse cue for the first speaker of a round. Goes at the top of the per-round "
+                        "context block in the final user turn (never in the system prompt).",
             json_schema_extra={"widget": "textarea", "rows": 3},
         )
 
@@ -114,8 +114,8 @@ class Pipeline(StreamingBlueprint):
                 "introduce yourself by name and mention your area of expertise or perspective. "
                 "Keep it concise (1-2 sentences), then proceed with your response."
             ),
-            description="Terse prefix prepended to the pipeline System Prompt when a speaker appears "
-                        "for the first time. This gets added before the main awareness prompt.",
+            description="Terse cue when a speaker appears for the first time in a conversation. Goes at the "
+                        "top of the per-round context block in the final user turn (never in the system prompt).",
             json_schema_extra={"widget": "textarea", "rows": 3},
         )
 
@@ -196,11 +196,9 @@ class Pipeline(StreamingBlueprint):
             self._dbg_step("❌ Missing pipeline system prompt — aborting run.")
             return
 
-        # Append web search and memory to awareness template (more efficient than per-speaker injection)
-        if web_search_context:
-            awareness_prompt_template += f"\n\n{web_search_context}"
-        if memory_context:
-            awareness_prompt_template += f"\n\n{memory_context}"
+        # Web search and memory context are per-turn: they go into the final user turn of each speaker
+        # request (see _build_round_context), never into the system prompt, so the system prompt stays a
+        # stable prompt-cache prefix for the engine.
 
         # --- 1. UNIFIED ORCHESTRATION ---
         if not self.all_speakers:
@@ -317,75 +315,40 @@ class Pipeline(StreamingBlueprint):
                     and speaker_name not in self.introduced_speakers[conv_key]
                 )
 
-                # Build context for each speaker (first vs. subsequent)
-                if i > 0:
-                    previous_takes = [
-                        f"• {current_round_responded_speakers[j]['name']} said: {res[:200]}{'...' if len(res) > 200 else ''}"
-                        for j, res in enumerate(speaker_responses)
-                    ]
-                    awareness_context = "\n".join(previous_takes)
-
-                    # Build base prompt from pipeline system prompt
-                    base_prompt = awareness_prompt_template
-
-                    # Prepend introduction prefix if this is their first time
-                    if needs_introduction:
-                        intro_prefix = str(self.valves.INTRODUCTION_PROMPT_PREFIX).format(
-                            speaker_name=speaker_name
-                        )
-                        prompt_template = intro_prefix + base_prompt
-                    else:
-                        prompt_template = base_prompt
-
-                    # Format the complete prompt (escape user content to prevent format string issues with vLLM)
-                    system_prompt_content = prompt_template.format(
-                        speaker_name=self._escape_format_braces(speaker_name),
-                        user_message=self._escape_format_braces(user_message),
-                        previous_context=self._escape_format_braces(awareness_context),
-                        current_date=datetime.now().strftime("%B %d, %Y"),
-                        current_round_speakers=self._escape_format_braces(current_speakers_str),
-                        historical_speakers=self._escape_format_braces(historical_speakers_str),
-                        introduction_instructions="",
-                    )
-                else:  # First speaker
-                    # Build base prompt from pipeline system prompt
-                    base_prompt = awareness_prompt_template
-
-                    # Prepend appropriate prefix based on introduction status
-                    if needs_introduction:
-                        intro_prefix = str(self.valves.INTRODUCTION_PROMPT_PREFIX).format(
-                            speaker_name=speaker_name
-                        )
-                        prompt_template = intro_prefix + base_prompt
-                    else:
-                        first_speaker_prefix = str(self.valves.FIRST_SPEAKER_PROMPT_PREFIX).format(
-                            speaker_name=speaker_name
-                        )
-                        prompt_template = first_speaker_prefix + base_prompt
-
-                    # Format the complete prompt (escape user content to prevent format string issues with vLLM)
-                    system_prompt_content = prompt_template.format(
-                        speaker_name=self._escape_format_braces(speaker_name),
-                        user_message=self._escape_format_braces(user_message),
-                        previous_context="",  # No previous context for first speaker
-                        current_date=datetime.now().strftime("%B %d, %Y"),
-                        current_round_speakers=self._escape_format_braces(current_speakers_str),
-                        historical_speakers=self._escape_format_braces(historical_speakers_str),
-                        introduction_instructions="",
-                    )
+                # Prompt layout (2026-11-02): the system prompt is static per speaker (only {speaker_name}
+                # is filled), the conversation history follows, and everything that changes per round
+                # (date, the other speakers, previous takes, web research, memory, profile, introduction
+                # cue, the user's message) goes into the final user turn. The engine's prompt cache keys on
+                # the prefix, so system + history is reused across rounds and only the last turn is new.
+                static_system = self._format_static_system_prompt(awareness_prompt_template, speaker_name)
+                previous_takes = [
+                    f"• {current_round_responded_speakers[j]['name']} said: {res[:200]}{'...' if len(res) > 200 else ''}"
+                    for j, res in enumerate(speaker_responses)
+                ]
+                round_context = self._build_round_context(
+                    speaker_name=speaker_name,
+                    is_first=(i == 0),
+                    needs_introduction=needs_introduction,
+                    previous_takes=previous_takes,
+                    current_speakers_str=current_speakers_str,
+                    historical_speakers_str=historical_speakers_str,
+                    web_search_context=web_search_context,
+                    memory_context=memory_context,
+                    user_context=self._build_user_context_section(user_profile),
+                )
 
                 # Mark this speaker as introduced
                 if needs_introduction:
                     self.introduced_speakers[conv_key].add(speaker_name)
 
-                # Build complete speaker prompt with user context
-                user_context = self._build_user_context_section(user_profile)
-                full_system_prompt = system_prompt_content + user_context
-
-                speaker_messages = [
-                    {"role": "system", "content": full_system_prompt},
-                    {"role": "user", "content": user_message},
-                ]
+                # The question goes in as its own plain user turn, exactly as Open WebUI will store it in the
+                # history, and the round context follows as a second user turn. That keeps "system + first user
+                # turn" identical from round one onward, which is what a slot-cache proxy keys a conversation by,
+                # and keeps the stored history a true prefix of this request.
+                speaker_messages = [{"role": "system", "content": static_system}]
+                speaker_messages.extend(self._history_for_speaker(messages, speaker_name))
+                speaker_messages.append({"role": "user", "content": user_message})
+                speaker_messages.append({"role": "user", "content": f"{round_context}\n\nAnswer the user's message in the previous turn now, as {speaker_name}."})
 
                 # Get tool IDs for this speaker's model
                 speaker_tool_ids = self._get_model_tool_ids(speaker["model"])
@@ -1009,6 +972,152 @@ Select and order the speakers now."""
         if hints:
             return ". ".join(hints[:3])
         return ""
+
+    def _format_static_system_prompt(self, template: str, speaker_name: str) -> str:
+        """Fill the per-speaker template with the speaker's name only. Every other placeholder of the older
+        template shape (user message, date, takes, speaker lists) is filled with an empty string, so an
+        un-migrated Open WebUI system prompt still works; the per-round values travel in the user turn."""
+        # Open WebUI merges per-turn material into the same system message the template is read from:
+        # the web-search <context> block (RAG_SYSTEM_CONTEXT) and the memory filter's "User Context:".
+        # Both are delivered through the round context instead, so cut them out here or the system
+        # prompt would change every round and the prompt cache would never hit.
+        template = re.sub(r"<context>.*?</context>", "", template, flags=re.S)
+        template = re.split(r"\n\s*User Context:", template, maxsplit=1)[0]
+        name = self._escape_format_braces(speaker_name)
+        try:
+            return template.format(
+                speaker_name=name, user_message="", previous_context="", current_date="",
+                current_round_speakers="", historical_speakers="", introduction_instructions="",
+            ).strip()
+        except (KeyError, IndexError, ValueError):
+            return template.replace("{speaker_name}", speaker_name).strip()
+
+    def _history_for_speaker(self, messages: List[dict], speaker_name: str) -> List[dict]:
+        """The conversation so far, segregated by speaker (2026-11-03). Every stored circle reply is split
+        into its "**Name**: text" blocks: this speaker's own block becomes an assistant turn, the other
+        speakers' blocks go into a user turn labelled as theirs. The model then only ever sees its own voice
+        under the assistant role, so it cannot continue the other speakers' blocks as if they were its own
+        (Father Spyridon wrote Peter's take in round 3 of the 2026-11-02 test; Peter took Paul's Damascus
+        story from a take). System messages are dropped and the current user message is excluded: the
+        caller re-sends it as its own plain turn before the round context. Already truncated by
+        _truncate_history. The history is the same for every speaker except for which blocks sit under
+        which role, so system + history stays a stable prefix across rounds."""
+        conv = [
+            m for m in messages
+            if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)
+        ]
+        if conv and conv[-1]["role"] == "user":
+            conv = conv[:-1]  # the current question is re-sent by the caller as its own plain turn
+        out: List[dict] = []
+        for m in conv:
+            content = m.get("content", "")
+            if m["role"] == "user":
+                if content.strip():
+                    out.append({"role": "user", "content": content})
+                continue
+            blocks = self._split_circle_reply(content)
+            if not blocks:
+                # Not a circle reply (an error text, a reply from before the circle format): keep it as it was.
+                cleaned = self._clean_history_turn("assistant", content)
+                if cleaned:
+                    out.append({"role": "assistant", "content": cleaned})
+                continue
+            own = [text for name, text in blocks if name == speaker_name]
+            others = [(name, text) for name, text in blocks if name != speaker_name]
+            if own:
+                out.append({"role": "assistant", "content": "\n\n".join(own)})
+            if others:
+                head = (
+                    "The other speakers' replies to that message. These are their words, not yours and not the user's:"
+                    if own else
+                    "You did not speak in that round. The speakers' replies to that message. These are their words, not yours and not the user's:"
+                )
+                body = "\n\n".join(f"**{name}**: {text}" for name, text in others)
+                out.append({"role": "user", "content": f"{head}\n\n{body}"})
+        return out
+
+    _CHROME_LINE = re.compile(r"^\s*(🔍 \*\*|💬 \*\*|🔧 \*\*|✅ \*\*Circle Complete|❌ \*\*|---\s*$)")
+    _AVATAR_MD = re.compile(r"!\[[^\]]*\]\([^)]*\)\s*")
+    # The heading lines get_speaker_image_markdown writes: "![Name](url) **Name**:" (alt text and bold name
+    # must agree) or, without an avatar root, "**Name:**" / "**🎤 Name:**". Matched on the raw line, before
+    # the avatar is stripped: a bold label the model wrote itself ("**Key points**:", or one speaker heading
+    # its text with another's name) is body text, not a heading.
+    _SPEAKER_HEADING_AVATAR = re.compile(r"^!\[([^\]]+)\]\([^)]*\)\s*\*\*\1\*\*:\s*$")
+    _SPEAKER_HEADING_PLAIN = re.compile(r"^\*\*(?:🎤 )?([^*\n]+):\*\*\s*$")
+
+    def _heading_speaker(self, raw_line: str, known: set) -> Optional[str]:
+        """The avatar form is trusted on its own (alt text and bold name agree), so a speaker since renamed
+        or removed in Open WebUI keeps its old blocks. The plain form is only written when
+        PROFILE_THUMBNAIL_ROOT is empty, so it counts only then, and only for a configured speaker name."""
+        m = self._SPEAKER_HEADING_AVATAR.match(raw_line)
+        if m:
+            return m.group(1).strip()
+        if str(getattr(self.valves, "PROFILE_THUMBNAIL_ROOT", "") or "").strip():
+            return None
+        m = self._SPEAKER_HEADING_PLAIN.match(raw_line)
+        if not m:
+            return None
+        name = m.group(1).strip()
+        return name if name in known else None
+
+    def _split_circle_reply(self, content: str) -> List[tuple]:
+        """A stored circle reply as (speaker name, text) blocks in order, split on the heading lines the
+        pipeline writes for configured speakers (avatar images and chrome removed from the text). Anything
+        before the first heading (the "speakers selected" line) is dropped. Empty list when the text has no
+        speaker headings."""
+        known = {str(sp.get("name", "")).strip() for sp in (self.all_speakers or [])}
+        known.discard("")
+        blocks: List[tuple] = []
+        name = None
+        buf: List[str] = []
+        for raw in content.splitlines():
+            heading = self._heading_speaker(raw, known)
+            if heading:
+                if name is not None:
+                    blocks.append((name, "\n".join(buf).strip()))
+                name, buf = heading, []
+                continue
+            line = self._AVATAR_MD.sub("", raw)
+            if self._CHROME_LINE.match(line):
+                continue
+            if name is not None:
+                buf.append(line)
+        if name is not None:
+            blocks.append((name, "\n".join(buf).strip()))
+        return [(n, re.sub(r"\n{3,}", "\n\n", t)) for n, t in blocks if t]
+
+    def _clean_history_turn(self, role: str, content: str) -> str:
+        """An assistant turn as Open WebUI stored it carries the pipeline's own chrome: status lines,
+        avatar images, separators, the completion banner. Used for assistant turns that are not circle
+        replies (no speaker headings); circle replies go through _split_circle_reply instead."""
+        if role != "assistant":
+            return content
+        lines = [self._AVATAR_MD.sub("", ln) for ln in content.splitlines()]
+        kept = [ln for ln in lines if not self._CHROME_LINE.match(ln)]
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+    def _build_round_context(
+        self, speaker_name: str, is_first: bool, needs_introduction: bool, previous_takes: List[str],
+        current_speakers_str: str, historical_speakers_str: str, web_search_context: str,
+        memory_context: str, user_context: str,
+    ) -> str:
+        """Everything that changes per round, as one block for the final user turn."""
+        parts = []
+        if needs_introduction:
+            parts.append(str(self.valves.INTRODUCTION_PROMPT_PREFIX).format(speaker_name=speaker_name))
+        elif is_first:
+            parts.append(str(self.valves.FIRST_SPEAKER_PROMPT_PREFIX).format(speaker_name=speaker_name))
+        parts.append(f"CURRENT DATE: {datetime.now().strftime('%B %d, %Y')}")
+        parts.append(f"**Current Speakers in this Round:**\n{current_speakers_str}")
+        parts.append("**Previous Speakers' Takes (in this round):**\n" + ("\n".join(previous_takes) if previous_takes else "None yet: you open this round."))
+        parts.append(f"**Historical Speakers (not in this round, but spoke previously):**\n{historical_speakers_str}")
+        if web_search_context:
+            parts.append(web_search_context)
+        if memory_context:
+            parts.append(memory_context)
+        if user_context and user_context.strip():
+            parts.append(user_context.strip())
+        return "\n\n".join(parts)
 
     def _build_user_context_section(self, user_profile: dict) -> str:
         """Build user context section to append to speaker prompts"""

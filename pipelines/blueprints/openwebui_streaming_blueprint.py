@@ -279,7 +279,7 @@ class Pipeline:
                 payload["stream_options"] = {"include_usage": True}
                 self._dbg_step("  📊 Usage tracking enabled")
             
-            self._dbg_step(f"  payload: {payload}")
+            self._dbg_step("  payload: " + ", ".join(f"{m.get('role')}:{len(str(m.get('content', '')))}ch" for m in messages))
             
             if tool_ids:
                 payload["metadata"] = {
